@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <title>Mermaid v11 Test</title>
+  <style>
+    body { background: #0d1117; color: #e6edf3; font-family: Inter, sans-serif; padding: 40px; }
+    #output { margin-top: 20px; padding: 20px; border-radius: 10px; background: #161b22; border: 1px solid #30363d; }
+    #error  { color: #f85149; margin-top: 10px; font-size: 13px; }
+    pre { font-family: monospace; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h2>Mermaid v11 Render Test</h2>
+  <p>Testing diagram render with correct syntax:</p>
+  <div id="output">⏳ Rendering...</div>
+  <div id="error"></div>
+
+  <script type="module">
+    // Test the exact sanitize + render pipeline we use in MermaidBlock
+    const rawCode = `flowchart TD
+    A[Potensi Wilayah] -->|Dikompromikan oleh| B[Masalah Utama]
+    B -->|Dampak| C[Kerusakan Ekosistem]
+    C -->|Perlu| D[Strategi Berkelanjutan]
+    D -->|Melalui| E[Pengelolaan Kawasan]
+    E -->|Mengarah ke| F[Kota Berkelanjutan]`
+
+    function sanitize(code) {
+      return code
+        .replace(/\|([^|\n]*)\|>/g, '|$1|')
+        .replace(/⟶|⟹|⇒/g, '-->')
+        .trim()
+    }
+
+    const clean = sanitize(rawCode)
+    console.log('Clean code:', clean)
+
+    try {
+      const { default: mermaid } = await import('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs')
+      
+      mermaid.initialize({
+        startOnLoad: false,
+        suppressErrorRendering: true,
+        theme: 'dark',
+        themeVariables: {
+          background: '#0d1117',
+          primaryColor: '#1c3a5e',
+          primaryBorderColor: '#4f8ef7',
+          primaryTextColor: '#e6edf3',
+          lineColor: '#4f8ef7',
+          fontFamily: 'Inter, sans-serif',
+          fontSize: '13px',
+        }
+      })
+
+      const id = `test-${Date.now()}`
+      const { svg } = await mermaid.render(id, clean)
+      
+      const out = document.getElementById('output')
+      out.innerHTML = svg
+      out.style.textAlign = 'center'
+      const svgEl = out.querySelector('svg')
+      if (svgEl) {
+        svgEl.style.maxWidth = '100%'
+        svgEl.style.height = 'auto'
+        svgEl.removeAttribute('width')
+      }
+      console.log('✅ Render success')
+    } catch(e) {
+      console.error('❌ Render error:', e)
+      document.getElementById('output').textContent = '❌ Failed'
+      document.getElementById('error').textContent = e.message
+    }
+  </script>
+</body>
+</html>
