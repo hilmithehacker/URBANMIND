@@ -11,6 +11,25 @@ export const PAPER_SIZES: Record<PaperSize, { w: number; h: number; scale: numbe
   'A0': { w: 4494, h: 3179, scale: 4.0 }
 }
 export type ColorMode = 'single' | 'categorized'
+export type ClassificationMode = 'single' | 'categorized' | 'graduated'
+export type StylePreset = 'custom' | 'soft' | 'bold' | 'pastel' | 'mono'
+export type ColorRamp = 'formal' | 'grayscale' | 'pastel' | 'high-contrast' | 'colorblind' | 'custom'
+export type PatternFill = 'none' | 'diagonal' | 'cross' | 'dots'
+export type PointSymbolType = 'circle' | 'square' | 'triangle' | 'diamond' | 'star'
+export type LayoutMode = 'template' | 'composer'
+export type LayoutElementId = 'title' | 'legend' | 'inset' | 'scaleBar' | 'northArrow' | 'source'
+
+export interface LayoutItem {
+  id: LayoutElementId
+  label: string
+  visible: boolean
+  top: number
+  left: number
+  width: number
+  height: number
+  zIndex: number
+  locked: boolean
+}
 
 export const FONTS = [
   { id: 'Arial, sans-serif', label: 'Arial' },
@@ -57,13 +76,18 @@ export interface MapLayer {
   fillOpacity: number
   strokeWidth: number
   strokeDash: 'solid' | 'dashed' | 'dotted'
+  lineCap: 'round' | 'butt' | 'square'
+  lineJoin: 'round' | 'miter' | 'bevel'
+  stylePreset: StylePreset
   // Categorized
   colorField: string
   colorMap: Record<string, string>
   categoryLabels: Record<string, string>
   // Point-specific
   pointRadius: number
-  pointSymbol: 'circle' | 'square' | 'triangle'
+  pointSymbol: PointSymbolType
+  pointStrokeWidth: number
+  pointOpacity: number
   // Labels
   labelField: string
   showLabels: boolean
@@ -73,8 +97,16 @@ export interface MapLayer {
   // Legend
   legendLabel: string
   legendShow: boolean
+  // Advanced styling
+  classificationMode: ClassificationMode
+  colorRamp: ColorRamp
+  graduatedField: string
+  graduatedBreaks: number
+  outerStrokeColor: string
+  outerStrokeWidth: number
+  patternFill: PatternFill
+  // QML / metadata
   hasQml?: boolean
-  // Metadata
   featureCount?: number
   fields?: string[]
   // Leaflet ref

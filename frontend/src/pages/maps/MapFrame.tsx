@@ -1,5 +1,5 @@
-import { forwardRef } from 'react'
-import type { MapMeta, MapLayer, TemplateType } from './mapsTypes'
+import { forwardRef, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { LayoutItem, LayoutMode, MapMeta, MapLayer, TemplateType } from './mapsTypes'
 import { PAPER_SIZES } from './mapsTypes'
 
 interface Props {
@@ -7,6 +7,9 @@ interface Props {
   showInset: boolean; insetUrl: string
   ticks: { lon: string; lat: string; pct: number }[]
   dynamicScale: number
+  layoutMode: LayoutMode
+  layoutItems: LayoutItem[]
+  onLayoutChange: (item: LayoutItem) => void
 }
 
 // ── North Arrow ──────────────────────────────────────────────────────────────
@@ -119,10 +122,49 @@ function GridLines({ lonTicks, latTicks, s, color = 'rgba(0,0,0,0.15)' }: { lonT
     </div>
   )
 }
+function clamp(val: number, min: number, max: number) {
+  return Math.min(Math.max(val, min), max)
+}
 
+function ComposerBox({ item, onDragStart, onResizeStart, children }: { item: LayoutItem; onDragStart: (e: React.PointerEvent<HTMLDivElement>, item: LayoutItem) => void; onResizeStart: (e: React.PointerEvent<HTMLDivElement>, item: LayoutItem) => void; children: React.ReactNode }) {
+  return (
+    <div
+      onPointerDown={(e) => { if (item.locked) return; onDragStart(e, item) }}
+      style={{
+        position: 'absolute',
+        top: item.top,
+        left: item.left,
+        width: item.width,
+        height: item.height,
+        zIndex: item.zIndex,
+        border: '1px solid rgba(0,0,0,0.12)',
+        background: 'rgba(255,255,255,0.95)',
+        boxShadow: '0 10px 30px rgba(0,0,0,0.12)',
+        borderRadius: 8,
+        overflow: 'hidden',
+        cursor: item.locked ? 'default' : 'move',
+        display: item.visible ? 'flex' : 'none',
+        flexDirection: 'column'
+      }}
+    >
+      <div style={{ background: 'rgba(15,23,42,0.08)', padding: '6px 8px', fontSize: 10, fontWeight: 700, letterSpacing: '0.02em', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 6 }}>
+        <span>{item.label}</span>
+        {item.locked ? <span style={{ fontSize: 10, opacity: 0.7 }}>Locked</span> : null}
+      </div>
+      <div style={{ position: 'relative', flex: 1, padding: 8, overflow: 'hidden' }}>{children}</div>
+      {!item.locked && (
+        <div
+          onPointerDown={(e) => { e.stopPropagation(); onResizeStart(e, item) }}
+          style={{ position: 'absolute', right: 4, bottom: 4, width: 14, height: 14, background: 'rgba(0,0,0,0.3)', cursor: 'nwse-resize', borderRadius: 3 }}
+        />
+      )}
+    </div>
+  )
+}
 // ── Main MapFrame ─────────────────────────────────────────────────────────────
 const MapFrame = forwardRef<HTMLDivElement, Props>(({
-  template, meta, font, layers, showInset, insetUrl, ticks, dynamicScale
+  template, meta, font, layers, showInset, insetUrl, ticks, dynamicScale,
+  layoutMode, layoutItems, onLayoutChange
 }, ref) => {
   const paper = PAPER_SIZES[meta.paperSize || 'A4']
   const s = paper.scale
@@ -138,6 +180,118 @@ const MapFrame = forwardRef<HTMLDivElement, Props>(({
 
   const lonTicks = ticks.filter(t => t.lon)
   const latTicks = ticks.filter(t => t.lat)
+  const dragState = useRef<{
+    item: LayoutItem
+    type: 'drag' | 'resize'
+    startX: number
+    startY: number
+    startTop: number
+    startLeft: number
+    startWidth: number
+    startHeight: number
+  } | null>(null)
+
+  const handlePointerMove = useCallback((event: PointerEvent) => {
+    const state = dragState.current
+    if (!state) return
+    event.preventDefault()
+    const dx = event.clientX - state.startX
+    const dy = event.clientY - state.startY
+    const item = layoutItems.find(i => i.id === state.item.id)
+    if (!item) return
+
+    if (state.type === 'drag') {
+      const left = clamp(state.startLeft + dx, 16, MAP_W - state.startWidth - 16)
+      const top = clamp(state.startTop + dy, 16, MAP_H - state.startHeight - 16)
+      onLayoutChange({ ...item, left, top })
+    } else {
+      const width = clamp(state.startWidth + dx, 120, MAP_W - state.startLeft - 16)
+      const height = clamp(state.startHeight + dy, 80, MAP_H - state.startTop - 16)
+      onLayoutChange({ ...item, width, height })
+    }
+  }, [layoutItems, onLayoutChange, MAP_W, MAP_H])
+
+  useEffect(() => {
+    const move = (e: PointerEvent) => handlePointerMove(e)
+    const up = () => { dragState.current = null }
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+    return () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+    }
+  }, [handlePointerMove])
+
+  const startDrag = (e: React.PointerEvent<HTMLDivElement>, item: LayoutItem) => {
+    if (item.locked) return
+    e.preventDefault()
+    dragState.current = {
+      item,
+      type: 'drag',
+      startX: e.clientX,
+      startY: e.clientY,
+      startTop: item.top,
+      startLeft: item.left,
+      startWidth: item.width,
+      startHeight: item.height
+    }
+  }
+
+  const startResize = (e: React.PointerEvent<HTMLDivElement>, item: LayoutItem) => {
+    if (item.locked) return
+    e.preventDefault()
+    dragState.current = {
+      item,
+      type: 'resize',
+      startX: e.clientX,
+      startY: e.clientY,
+      startTop: item.top,
+      startLeft: item.left,
+      startWidth: item.width,
+      startHeight: item.height
+    }
+  }
+
+  const renderComposerContent = (item: LayoutItem) => {
+    switch (item.id) {
+      case 'title':
+        return (
+          <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+            <div style={{ fontSize: 18 * s, fontWeight: 900, color: black, textTransform: 'uppercase', lineHeight: 1.1 }}>{meta.title || 'JUDUL PETA'}</div>
+            {meta.subtitle && <div style={{ fontSize: 11 * s, color: '#475569', marginTop: 6 * s }}>{meta.subtitle}</div>}
+          </div>
+        )
+      case 'legend':
+        return <LegendItems layers={layers} textColor={black} s={s * 1.0} />
+      case 'northArrow':
+        return <NorthArrow color={black} s={1.2 * s} />
+      case 'scaleBar':
+        return <ScaleBar scale={dynamicScale} s={1.0 * s} align='left' />
+      case 'inset':
+        return insetUrl ? <img src={insetUrl} alt="Inset" style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: 6 }} /> : <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#475569', border: '1px dashed #94a3b8', borderRadius: 6, padding: 8, textAlign: 'center' }}>Inset kosong</div>
+      case 'source':
+        return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', fontSize: 11 * s, color: '#475569', textAlign: 'center' }}>{meta.source || 'Sumber data peta'}</div>
+      default:
+        return null
+    }
+  }
+
+  if (layoutMode === 'composer') {
+    return (
+      <div ref={ref} style={{ ...fontStyle, position: 'relative', width: MAP_W, height: MAP_H, overflow: 'hidden' }}>
+        <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }} />
+        <div style={{ position: 'absolute', inset: '16px', border: '1px dashed rgba(15, 23, 42, 0.14)', pointerEvents: 'none' }} />
+        <div style={{ position: 'absolute', inset: 0, display: 'grid', gridTemplateColumns: 'repeat(20, 1fr)', gridTemplateRows: 'repeat(20, 1fr)', pointerEvents: 'none' }}>
+          {Array.from({ length: 20 * 20 }).map((_, idx) => <div key={idx} style={{ border: '1px solid rgba(15, 23, 42, 0.06)' }} />)}
+        </div>
+        {layoutItems.filter(item => item.visible).map(item => (
+          <ComposerBox key={item.id} item={item} onDragStart={startDrag} onResizeStart={startResize}>
+            {renderComposerContent(item)}
+          </ComposerBox>
+        ))}
+      </div>
+    )
+  }
 
   if (template === 'formal-big' || template === 'formal-simple') {
     const isDouble = template === 'formal-big'
@@ -147,7 +301,7 @@ const MapFrame = forwardRef<HTMLDivElement, Props>(({
         width: MAP_W, height: MAP_H,
         border: isDouble ? `${0.6 * s}px double ${black}` : `${0.2 * s}px solid ${black}`,
         display: 'flex', flexDirection: isPortrait ? 'column' : 'row',
-        background: '#fff'
+        background: 'none'
       }}>
         {/* ── Zebra coordinate border (4-side) ── */}
         {ticks.length > 0 && (

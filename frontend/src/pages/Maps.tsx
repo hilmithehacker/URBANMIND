@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { Layers, Image as Img, Download, RefreshCw, Settings, Map as MapIcon } from 'lucide-react'
 import MapFrame from './maps/MapFrame'
 import LayerPanel from './maps/LayerPanel'
-import type { MapLayer, MapMeta, TemplateType, PaperSize } from './maps/mapsTypes'
+import type { LayoutItem, LayoutMode, MapLayer, MapMeta, TemplateType, PaperSize } from './maps/mapsTypes'
 import { DEFAULT_META, FONTS, BASEMAPS, TEMPLATES, PALETTE, getMapRect, formatDeg, calcScale, PAPER_SIZES } from './maps/mapsTypes'
 import { loadLeaflet, loadShp, loadJSZip, parseZipViaBackend } from './maps/mapUtils'
 import type { BackendLayerInfo } from './maps/mapUtils'
@@ -16,11 +16,25 @@ declare global {
 }
 declare const L: any
 
-type Tab = 'compose' | 'layers' | 'inset' | 'export'
 let _lid = 0
 const uid = () => `l${++_lid}`
 
-const MAP_STORAGE_KEY = 'urbanmind_maps_meta'
+const MAP_STORAGE_KEY = 'urbanmind_maps_project'
+
+function clamp(val: number, min: number, max: number) {
+  return Math.min(Math.max(val, min), max)
+}
+
+function getDefaultLayoutItems(mapW: number, mapH: number): LayoutItem[] {
+  return [
+    { id: 'title', label: 'Judul Peta', visible: true, top: 24, left: 24, width: 420, height: 100, zIndex: 130, locked: false },
+    { id: 'legend', label: 'Legenda', visible: true, top: 24, left: mapW - 284, width: 260, height: 250, zIndex: 120, locked: false },
+    { id: 'northArrow', label: 'North Arrow', visible: true, top: 144, left: 24, width: 120, height: 120, zIndex: 110, locked: false },
+    { id: 'scaleBar', label: 'Skala', visible: true, top: 280, left: 24, width: 220, height: 70, zIndex: 100, locked: false },
+    { id: 'inset', label: 'Inset', visible: true, top: mapH - 170, left: mapW - 224, width: 200, height: 150, zIndex: 90, locked: false },
+    { id: 'source', label: 'Sumber', visible: true, top: mapH - 92, left: Math.max(24, (mapW - 240) / 2), width: 240, height: 70, zIndex: 80, locked: false }
+  ]
+}
 
 function detectType(gj: any): 'polygon' | 'line' | 'point' {
   const t = gj?.features?.[0]?.geometry?.type || ''
@@ -33,6 +47,40 @@ function buildColorMap(gj: any, field: string): Record<string, string> {
   const m: Record<string, string> = {}
   vals.forEach((v, i) => { m[v] = PALETTE[i % PALETTE.length] })
   return m
+}
+function buildGraduatedMap(gj: any, field: string, breaks: number, ramp: string): Record<string, string> {
+  const values = (gj.features || [])
+    .map((f: any) => Number(f.properties?.[field]))
+    .filter((v: number) => !Number.isNaN(v))
+    .sort((a: number, b: number) => a - b)
+  if (!values.length) return {}
+
+  const colors = getRampColors(ramp, breaks)
+  const min = values[0]
+  const max = values[values.length - 1]
+  const step = Math.max((max - min) / Math.max(breaks, 1), 1)
+  const map: Record<string, string> = {}
+
+  for (const feature of gj.features || []) {
+    const value = Number(feature.properties?.[field])
+    if (Number.isNaN(value)) continue
+    const bucket = Math.min(Math.floor((value - min) / step), breaks - 1)
+    const key = `${Math.round(min + bucket * step)}-${Math.round(min + (bucket + 1) * step)}`
+    map[key] = colors[bucket]
+  }
+  return map
+}
+function getRampColors(ramp: string, count: number) {
+  const palettes: Record<string, string[]> = {
+    formal: ['#1f2937', '#3f51b5', '#2563eb', '#0ea5e9', '#22c55e'],
+    grayscale: ['#111827', '#374151', '#6b7280', '#9ca3af', '#d1d5db'],
+    pastel: ['#f8b4d9', '#a7f3d0', '#fcd34d', '#93c5fd', '#fbbf24'],
+    'high-contrast': ['#000000', '#d97706', '#dc2626', '#0f766e', '#2563eb'],
+    colorblind: ['#0072b2', '#d55e00', '#cc79a7', '#009e73', '#e69f00'],
+    custom: PALETTE,
+  }
+  const palette = palettes[ramp] || palettes.formal
+  return Array.from({ length: count }, (_, i) => palette[i % palette.length])
 }
 function dashArray(d: string) {
   if (d === 'dashed') return '8,4'
@@ -112,22 +160,39 @@ function parseQML(xml: string): QMLStyle | null {
   } catch (e) { console.error('QML Parse Error:', e); return null }
 }
 
+type Tab = 'compose' | 'layers' | 'inset' | 'export'
+
 export default function Maps() {
   const mapDivRef = useRef<HTMLDivElement>(null); const frameRef = useRef<HTMLDivElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null); const mapInst = useRef<any>(null); const baseTile = useRef<any>(null)
-  const [ready, setReady] = useState(false); const [tab, setTab] = useState<Tab>('compose')
+  const [ready, setReady] = useState(false)
   const [template, setTemplate] = useState<TemplateType>('formal-big'); const [basemap, setBasemap] = useState('none')
   const [font, setFont] = useState('Arial, sans-serif'); const [meta, setMeta] = useState<MapMeta>(DEFAULT_META)
   const [layers, setLayers] = useState<MapLayer[]>([]); const [selId, setSelId] = useState<string | null>(null)
   const [showInset, setShowInset] = useState(true); const [insetUrl, setInsetUrl] = useState('')
   const [showGrid, setShowGrid] = useState(true); const [ticks, setTicks] = useState<any[]>([])
-  const [dynamicScale, setDynamicScale] = useState(50000); 
+  const [dynamicScale, setDynamicScale] = useState(50000);
   const [targetScale, setTargetScale] = useState(50000);
+  const [layoutMode, setLayoutMode] = useState<LayoutMode>('template')
+  const [layoutItems, setLayoutItems] = useState<LayoutItem[]>(() => getDefaultLayoutItems(PAPER_SIZES.A4.w, PAPER_SIZES.A4.h))
+  const [mapCenter, setMapCenter] = useState<{ lat: number; lng: number } | null>(null)
+  const [mapZoom, setMapZoom] = useState<number | null>(null)
   const [exporting, setExporting] = useState(false); const [msg, setMsg] = useState('')
+  const [tab, setTab] = useState<'compose' | 'layers' | 'inset' | 'export'>('compose')
+  const selectedLayer = layers.find(l => l.id === selId) || null
+  const sel = selectedLayer
+  const [msgType, setMsgType] = useState<'info' | 'success' | 'warning' | 'error'>('info')
+  const [msgAction, setMsgAction] = useState<(() => void) | null>(null)
+
+  const showMessage = (message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info', action: (() => void) | null = null) => {
+    setMsg(message)
+    setMsgType(type)
+    setMsgAction(() => action)
+  }
 
   const refreshMap = () => {
     if (!mapInst.current) return
-    setMsg('⏳ Sinkronisasi komponen peta...')
+    showMessage('⏳ Sinkronisasi komponen peta...', 'info')
     
     // Bersihkan semua layer selain basemap
     mapInst.current.eachLayer((l: any) => {
@@ -144,34 +209,58 @@ export default function Maps() {
     
     mapInst.current.invalidateSize()
     updateTicks(mapInst.current)
-    setMsg('✅ Peta berhasil disinkronisasi')
+    showMessage('✅ Peta berhasil disinkronisasi', 'success')
   }
 
-  // Simpan meta setting (template, basemap, meta) ke localStorage
+  // Muat seluruh state proyek Maps dari localStorage
   useEffect(() => {
     try {
       const saved = localStorage.getItem(MAP_STORAGE_KEY)
       if (saved) {
-        const { savedTemplate, savedBasemap, savedFont, savedMeta } = JSON.parse(saved)
-        if (savedTemplate) setTemplate(savedTemplate)
-        if (savedBasemap) setBasemap(savedBasemap)
-        if (savedFont) setFont(savedFont)
-        if (savedMeta) setMeta(prev => ({ ...prev, ...savedMeta }))
+        const data = JSON.parse(saved)
+        if (data.template) setTemplate(data.template)
+        if (data.basemap) setBasemap(data.basemap)
+        if (data.font) setFont(data.font)
+        if (data.meta) setMeta(prev => ({ ...prev, ...data.meta }))
+        if (data.layers) setLayers((data.layers as MapLayer[]).map(layer => ({ ...layer, leafletLayer: null })))
+        if (data.selId) setSelId(data.selId)
+        if (data.showInset !== undefined) setShowInset(data.showInset)
+        if (data.insetUrl) setInsetUrl(data.insetUrl)
+        if (data.showGrid !== undefined) setShowGrid(data.showGrid)
+        if (data.targetScale) setTargetScale(data.targetScale)
+        if (data.layoutMode) setLayoutMode(data.layoutMode)
+        if (Array.isArray(data.layoutItems)) setLayoutItems(data.layoutItems)
+        if (data.mapCenter) setMapCenter(data.mapCenter)
+        if (data.mapZoom) setMapZoom(data.mapZoom)
       }
-    } catch { /* ignore */ }
+    } catch (error) {
+      console.warn('Gagal memuat state Maps:', error)
+    }
   }, [])
 
-  // Auto-save map settings ke localStorage setiap kali berubah
+  // Simpan state proyek Maps ke localStorage setiap kali berubah
   useEffect(() => {
     try {
       localStorage.setItem(MAP_STORAGE_KEY, JSON.stringify({
-        savedTemplate: template,
-        savedBasemap: basemap,
-        savedFont: font,
-        savedMeta: meta,
+        template,
+        basemap,
+        font,
+        meta,
+        layers: layers.map((layer) => ({ ...layer, leafletLayer: null })),
+        selId,
+        showInset,
+        insetUrl,
+        showGrid,
+        targetScale,
+        layoutMode,
+        layoutItems,
+        mapCenter,
+        mapZoom,
       }))
-    } catch { /* ignore */ }
-  }, [template, basemap, font, meta])
+    } catch (error) {
+      console.warn('Gagal menyimpan state Maps:', error)
+    }
+  }, [template, basemap, font, meta, layers, selId, showInset, insetUrl, showGrid, targetScale, layoutMode, layoutItems, mapCenter, mapZoom])
 
   useEffect(() => { if (meta.isFormal) setBasemap('none') }, [meta.isFormal])
   const paper = PAPER_SIZES[meta.paperSize || 'A4']
@@ -179,22 +268,37 @@ export default function Maps() {
   const MAP_W = isPortrait ? paper.h : paper.w
   const MAP_H = isPortrait ? paper.w : paper.h
   const rect = getMapRect(template, meta.orientation)
+  useEffect(() => {
+    setLayoutItems(prev => prev.map(item => ({
+      ...item,
+      left: clamp(item.left, 16, MAP_W - item.width - 16),
+      top: clamp(item.top, 16, MAP_H - item.height - 16)
+    })))
+  }, [MAP_W, MAP_H])
   const mapStyle: React.CSSProperties = { top: rect.top * paper.scale, left: rect.left * paper.scale, right: rect.right * paper.scale, bottom: rect.bottom * paper.scale }
 
   useEffect(() => { loadLeaflet(typeof L !== 'undefined' ? L : undefined).then(() => setReady(true)) }, [])
   useEffect(() => {
     if (!ready || !mapDivRef.current || mapInst.current) return
+    const initialCenter = mapCenter ? [mapCenter.lat, mapCenter.lng] : [-2, 118]
+    const initialZoom = mapZoom ?? 5
     const m = window.L.map(mapDivRef.current, { 
       zoomControl: false, 
       attributionControl: false,
+      inertia: true,
+      inertiaDeceleration: 2500,
+      inertiaMaxSpeed: 2200,
       zoomSnap: 0.01,
       zoomDelta: 0.01,
       wheelPxPerZoomLevel: 150
-    }).setView([-2, 118], 5)
+    }).setView(initialCenter, initialZoom)
     mapInst.current = m
-    m.on('moveend zoomend', () => { setDynamicScale(calcScale(m)); updateTicks(m) })
+    m.on('moveend zoomend', () => {
+      setDynamicScale(calcScale(m)); updateTicks(m)
+      const c = m.getCenter(); setMapCenter({ lat: c.lat, lng: c.lng }); setMapZoom(m.getZoom())
+    })
     updateTicks(m)
-  }, [ready])
+  }, [ready, mapCenter, mapZoom])
 
   useEffect(() => {
     if (!mapInst.current || !window.L) return
@@ -221,22 +325,123 @@ export default function Maps() {
   }
 
   const renderLayer = (l: MapLayer) => {
-    return window.L.geoJSON(l.geojson, {
-      style: (f: any) => {
-        let fill = l.fillColor; if (l.colorMode === 'categorized' && l.colorField) fill = l.colorMap[String(f.properties?.[l.colorField] ?? 'N/A')] || fill
-        return { color: l.strokeColor, weight: l.strokeWidth, fillColor: fill, fillOpacity: l.fillOpacity, dashArray: dashArray(l.strokeDash) }
+    const createStyle = (feature: any) => {
+      const props = feature.properties || {}
+      let fill = l.fillColor
+      if (l.classificationMode === 'categorized' && l.colorField) {
+        fill = l.colorMap[String(props[l.colorField] ?? 'N/A')] || fill
+      } else if (l.classificationMode === 'graduated' && l.graduatedField && l.colorMap) {
+        const value = Number(props[l.graduatedField])
+        if (!Number.isNaN(value)) {
+          const buckets = Object.keys(l.colorMap)
+          const match = buckets.find(key => {
+            const [min, max] = key.split('-').map(Number)
+            return !Number.isNaN(min) && !Number.isNaN(max) && value >= min && value <= max
+          })
+          if (match) fill = l.colorMap[match]
+        }
+      }
+      return {
+        color: l.strokeColor,
+        weight: l.strokeWidth,
+        fillColor: fill,
+        fillOpacity: l.featureType === 'point' ? l.pointOpacity : l.fillOpacity,
+        dashArray: dashArray(l.strokeDash),
+        lineCap: l.lineCap,
+        lineJoin: l.lineJoin
+      }
+    }
+
+    const mainLayer = window.L.geoJSON(l.geojson, {
+      style: createStyle,
+      pointToLayer: (feature: any, latlng: any) => {
+        const props = feature.properties || {}
+        let fill = l.fillColor
+        if (l.classificationMode === 'categorized' && l.colorField) fill = l.colorMap[String(props[l.colorField] ?? 'N/A')] || fill
+        if (l.classificationMode === 'graduated' && l.graduatedField && l.colorMap) {
+          const value = Number(props[l.graduatedField])
+          if (!Number.isNaN(value)) {
+            const buckets = Object.keys(l.colorMap)
+            const match = buckets.find(key => {
+              const [min, max] = key.split('-').map(Number)
+              return !Number.isNaN(min) && !Number.isNaN(max) && value >= min && value <= max
+            })
+            if (match) fill = l.colorMap[match]
+          }
+        }
+
+        const size = l.pointRadius * 2
+        const symbol = l.pointSymbol
+        if (symbol === 'square') {
+          return window.L.marker(latlng, {
+            icon: window.L.divIcon({
+              className: 'um-point-icon',
+              html: `<div style="width:${size}px;height:${size}px;background:${fill};border:${l.pointStrokeWidth}px solid ${l.strokeColor};opacity:${l.pointOpacity};border-radius:6px"></div>`,
+              iconSize: [size, size],
+              iconAnchor: [l.pointRadius, l.pointRadius]
+            })
+          })
+        }
+        if (symbol === 'triangle') {
+          return window.L.marker(latlng, {
+            icon: window.L.divIcon({
+              className: 'um-point-icon',
+              html: `<div style="width:0;height:0;border-left:${size / 2}px solid transparent;border-right:${size / 2}px solid transparent;border-bottom:${size}px solid ${fill};opacity:${l.pointOpacity}"></div>`,
+              iconSize: [size, size],
+              iconAnchor: [l.pointRadius, l.pointRadius]
+            })
+          })
+        }
+        if (symbol === 'diamond') {
+          return window.L.marker(latlng, {
+            icon: window.L.divIcon({
+              className: 'um-point-icon',
+              html: `<div style="width:${size}px;height:${size}px;background:${fill};border:${l.pointStrokeWidth}px solid ${l.strokeColor};transform:rotate(45deg);opacity:${l.pointOpacity}"></div>`,
+              iconSize: [size, size],
+              iconAnchor: [l.pointRadius, l.pointRadius]
+            })
+          })
+        }
+        if (symbol === 'star') {
+          return window.L.marker(latlng, {
+            icon: window.L.divIcon({
+              className: 'um-point-icon',
+              html: `<div style="width:${size}px;height:${size}px;clip-path:polygon(50% 0%,61% 35%,98% 35%,68% 57%,79% 91%,50% 70%,21% 91%,32% 57%,2% 35%,39% 35%);background:${fill};border:${l.pointStrokeWidth}px solid ${l.strokeColor};opacity:${l.pointOpacity}"></div>`,
+              iconSize: [size, size],
+              iconAnchor: [l.pointRadius, l.pointRadius]
+            })
+          })
+        }
+        return window.L.circleMarker(latlng, {
+          radius: l.pointRadius,
+          fillColor: fill,
+          color: l.strokeColor,
+          weight: l.pointStrokeWidth,
+          fillOpacity: l.pointOpacity
+        })
       },
-      pointToLayer: (f: any, latlng: any) => {
-        let fill = l.fillColor; if (l.colorMode === 'categorized' && l.colorField) fill = l.colorMap[String(f.properties?.[l.colorField] ?? 'N/A')] || fill
-        return window.L.circleMarker(latlng, { radius: l.pointRadius, fillColor: fill, color: l.strokeColor, weight: l.strokeWidth, fillOpacity: l.fillOpacity })
-      },
-      onEachFeature: (f: any, lyr: any) => {
-        if (l.showLabels && l.labelField && f.properties?.[l.labelField] != null) {
-          const txt = String(f.properties[l.labelField]); const halo = l.labelHalo ? `text-shadow:0 0 3px #fff,0 0 3px #fff;` : ''
+      onEachFeature: (feature: any, lyr: any) => {
+        if (l.showLabels && l.labelField && feature.properties?.[l.labelField] != null) {
+          const txt = String(feature.properties[l.labelField]); const halo = l.labelHalo ? `text-shadow:0 0 3px #fff,0 0 3px #fff;` : ''
           lyr.bindTooltip(`<span style="font-size:${l.labelSize}px;color:${l.labelColor};${halo}font-weight:600">${txt}</span>`, { permanent: true, direction: 'center', className: 'leaflet-label-clean', offset: [0, 0] })
         }
       }
-    }).addTo(mapInst.current)
+    })
+
+    if (l.outerStrokeWidth > 0 && l.featureType !== 'point') {
+      const outlineLayer = window.L.geoJSON(l.geojson, {
+        style: () => ({
+          color: l.outerStrokeColor,
+          weight: l.outerStrokeWidth,
+          opacity: 1,
+          fillOpacity: 0,
+          lineCap: l.lineCap,
+          lineJoin: l.lineJoin
+        })
+      })
+      return window.L.layerGroup([outlineLayer, mainLayer]).addTo(mapInst.current)
+    }
+    return mainLayer.addTo(mapInst.current)
   }
 
   const applyStyle = (id: string) => {
@@ -246,22 +451,41 @@ export default function Maps() {
       let cm = l.colorMap; if (l.colorMode === 'categorized' && l.colorField && !Object.keys(cm).length) cm = buildColorMap(l.geojson, l.colorField)
       const upd = { ...l, colorMap: cm, categoryLabels: l.categoryLabels || {} }; return { ...upd, leafletLayer: renderLayer(upd) }
     }))
-    setMsg('✅ Style diterapkan')
+    showMessage('✅ Style diterapkan', 'success')
   }
 
   useEffect(() => {
     if (!mapInst.current) return
     layers.forEach(l => {
-      if (l.leafletLayer && l.visible) {
+      if (l.leafletLayer && l.visible && l.leafletLayer.setStyle) {
         l.leafletLayer.setStyle((f: any) => {
           let fill = l.fillColor; let stroke = l.strokeColor; let weight = l.strokeWidth; let opac = l.fillOpacity
-          if (l.hasQml) { if (l.colorMode === 'categorized' && l.colorField) fill = l.colorMap[String(f.properties?.[l.colorField] ?? 'N/A')] || fill }
-          else if (meta.isFormal) {
+          if (l.classificationMode === 'categorized' && l.colorField) {
+            fill = l.colorMap[String(f.properties?.[l.colorField] ?? 'N/A')] || fill
+          } else if (l.classificationMode === 'graduated' && l.graduatedField && l.colorMap) {
+            const value = Number(f.properties?.[l.graduatedField])
+            if (!Number.isNaN(value)) {
+              const buckets = Object.keys(l.colorMap)
+              const match = buckets.find(key => {
+                const [min, max] = key.split('-').map(Number)
+                return !Number.isNaN(min) && !Number.isNaN(max) && value >= min && value <= max
+              })
+              if (match) fill = l.colorMap[match]
+            }
+          } else if (meta.isFormal) {
             if (l.featureType === 'polygon') { fill = '#f1f5f9'; stroke = '#000000'; weight = 0.5; opac = 0.4 }
             else if (l.featureType === 'line') { stroke = '#000000'; weight = 0.8 }
             else { fill = '#000000'; stroke = '#ffffff'; weight = 0.8 }
-          } else if (l.colorMode === 'categorized' && l.colorField) fill = l.colorMap[String(f.properties?.[l.colorField] ?? 'N/A')] || fill
-          return { color: stroke, weight: weight, fillColor: fill, fillOpacity: opac, dashArray: dashArray(l.strokeDash) }
+          }
+          return {
+            color: stroke,
+            weight: weight,
+            fillColor: fill,
+            fillOpacity: l.featureType === 'point' ? l.pointOpacity : opac,
+            dashArray: dashArray(l.strokeDash),
+            lineCap: l.lineCap,
+            lineJoin: l.lineJoin
+          }
         })
       }
     })
@@ -269,14 +493,14 @@ export default function Maps() {
 
   // ── addLayer: kirim ke backend, fallback ke client-side jika offline ──────
   const addLayer = async (files: FileList) => {
-    setMsg('⏳ Memproses file...')
+    showMessage('⏳ Memproses file...', 'info')
     const results: { name: string; gj: any; qml?: any }[] = []
 
     for (const file of Array.from(files)) {
       try {
         // ── ZIP: coba backend parser dulu ──────────────────────────────────
         if (file.name.toLowerCase().endsWith('.zip')) {
-          setMsg(`⏳ Mengirim ${file.name} ke parser...`)
+          showMessage(`⏳ Mengirim ${file.name} ke parser...`, 'info')
           const backendResult = await parseZipViaBackend(file)
 
           if (backendResult.success && backendResult.layers && backendResult.layers.length > 0) {
@@ -288,11 +512,11 @@ export default function Maps() {
               const errMsgs = invalidLayers.map((l: BackendLayerInfo) =>
                 `${l.name}: ${l.errors.join(', ')}`
               ).join(' | ')
-              setMsg(`⚠️ ${invalidLayers.length} layer invalid: ${errMsgs}`)
+              showMessage(`⚠️ ${invalidLayers.length} layer invalid: ${errMsgs}`, 'warning')
             }
 
             if (validLayers.length === 0) {
-              setMsg(`❌ Tidak ada layer valid dalam ${file.name}. ${backendResult.layers.map((l: BackendLayerInfo) => l.errors.join(', ')).join(' | ')}`)
+              showMessage(`❌ Tidak ada layer valid dalam ${file.name}. ${backendResult.layers.map((l: BackendLayerInfo) => l.errors.join(', ')).join(' | ')}`, 'error')
               continue
             }
 
@@ -300,14 +524,14 @@ export default function Maps() {
             for (const bl of validLayers) {
               results.push({ name: bl.name, gj: bl.geojson, qml: bl.qmlStyle ? { _parsed: bl.qmlStyle } : undefined })
             }
-            setMsg(`✅ Backend: ${validLayers.length} layer ditemukan dalam ${file.name}`)
+            showMessage(`✅ Backend: ${validLayers.length} layer ditemukan dalam ${file.name}`, 'success')
             continue
           }
 
           // Backend gagal/offline — fallback ke client-side
           const backendErr = backendResult.error || 'Backend tidak tersedia'
           console.warn('[addLayer] Backend parse failed, fallback client:', backendErr)
-          setMsg(`⚠️ Backend offline, parsing lokal: ${file.name}...`)
+          showMessage(`⚠️ Backend offline, parsing lokal: ${file.name}...`, 'warning')
 
           // ── Fallback: client-side parser ───────────────────────────────
           try {
@@ -338,7 +562,7 @@ export default function Maps() {
 
             for (const [base, components] of Object.entries(groups)) {
               if (!components.shp) continue
-              setMsg(`⏳ Parsing ${base}...`)
+              showMessage(`⏳ Parsing ${base}...`, 'info')
               try {
                 // Cari QML: exact match → fuzzy → singleton
                 let qmlObj = qmlMap[base] || null
@@ -361,11 +585,11 @@ export default function Maps() {
                 if (gj) results.push({ name: base, gj: Array.isArray(gj) ? gj[0] : gj, qml: qmlText })
               } catch (err: any) {
                 console.error(`[addLayer] Client parse failed for ${base}:`, err)
-                setMsg(`❌ Gagal parse ${base}: ${err.message}`)
+                showMessage(`❌ Gagal parse ${base}: ${err.message}`, 'error')
               }
             }
           } catch (clientErr: any) {
-            setMsg(`❌ Gagal parse ${file.name}: ${clientErr.message}`)
+            showMessage(`❌ Gagal parse ${file.name}: ${clientErr.message}`, 'error')
             continue
           }
 
@@ -375,12 +599,12 @@ export default function Maps() {
           results.push({ name: file.name.replace(/\.[^.]+$/, ''), gj: JSON.parse(text) })
         }
       } catch (e: any) {
-        setMsg(`❌ Gagal memuat ${file.name}: ${e.message}`)
+        showMessage(`❌ Gagal memuat ${file.name}: ${e.message}`, 'error')
       }
     }
 
     if (!results.length) {
-      setMsg('⚠️ Tidak ada layer valid yang ditemukan. Pastikan ZIP berisi .shp beserta .dbf dan .shx.')
+      showMessage('⚠️ Tidak ada layer valid yang ditemukan. Pastikan ZIP berisi .shp beserta .dbf dan .shx.', 'warning')
       return
     }
 
@@ -394,9 +618,18 @@ export default function Maps() {
           id: uid(), name, geojson: gj, featureType: detectType(gj),
           visible: true, featureCount: feats.length, fields,
           colorMode: 'single',
+          classificationMode: 'single',
+          colorRamp: 'formal',
+          graduatedField: '',
+          graduatedBreaks: 5,
+          outerStrokeColor: '#ffffff',
+          outerStrokeWidth: 0,
+          patternFill: 'none',
           fillColor: PALETTE[(prev.length + idx) % PALETTE.length],
           strokeColor: '#000000', fillOpacity: 0.65, strokeWidth: 1, strokeDash: 'solid',
+          lineCap: 'round', lineJoin: 'round', stylePreset: 'custom',
           colorField: '', colorMap: {}, categoryLabels: {}, pointRadius: 5, pointSymbol: 'circle',
+          pointStrokeWidth: 1.2, pointOpacity: 0.85,
           labelField: '', showLabels: false, labelSize: 10, labelColor: '#000000', labelHalo: true,
           legendLabel: name, legendShow: true, leafletLayer: null
         }
@@ -457,7 +690,7 @@ export default function Maps() {
       return next
     })
 
-    setMsg(`✅ ${results.length} layer berhasil dimuat ke peta`)
+    showMessage(`✅ ${results.length} layer berhasil dimuat ke peta`, 'success')
   }
 
   const updateLayer = (id: string, patch: Partial<MapLayer>) => setLayers(prev => prev.map(l => l.id === id ? { ...l, ...patch } : l))
@@ -467,7 +700,7 @@ export default function Maps() {
 
   const doExport = async (fmt: 'jpg' | 'pdf' | 'png') => {
     if (!wrapRef.current) return
-    setExporting(true); setMsg('Mengekspor...')
+    setExporting(true); showMessage('⏳ Mengekspor...', 'info')
     try {
       const h2c = (await import('html2canvas')).default
       const canvas = await h2c(wrapRef.current, { useCORS: true, allowTaint: true, scale: 2, backgroundColor: '#ffffff', logging: false })
@@ -479,8 +712,8 @@ export default function Maps() {
         const pdf = new jsPDF({ orientation: pdfW > pdfH ? 'landscape' : 'portrait', unit: 'mm', format: [pdfW, pdfH] })
         pdf.addImage(canvas.toDataURL('image/jpeg', 0.95), 'JPEG', 0, 0, pdfW, pdfH); pdf.save(`${fname}_${meta.paperSize}.pdf`)
       }
-      setMsg('✅ Berhasil diunduh')
-    } catch (e: any) { setMsg('❌ ' + e.message) } finally { setExporting(false) }
+      showMessage('✅ Berhasil diunduh', 'success')
+    } catch (e: any) { showMessage('❌ ' + e.message, 'error') } finally { setExporting(false) }
   }
 
   const toDataURL = (f: File) => new Promise<string>(r => { const fr = new FileReader(); fr.onload = e => r(e.target?.result as string); fr.readAsDataURL(f) })
@@ -500,10 +733,23 @@ export default function Maps() {
           <RefreshCw size={14} /> Sinkronisasi Peta
         </button>
       </div>
-      {msg && <div className={`alert ${msg.startsWith('✅') ? 'alert-success' : msg.startsWith('❌') ? 'alert-error' : 'alert-info'}`} style={{ margin: 0, borderRadius: 0, fontSize: 12, padding: '6px 16px' }}>{msg} <button onClick={() => setMsg('')} style={{ marginLeft: 8, background: 'none', border: 'none', cursor: 'pointer', color: 'inherit' }}>×</button></div>}
-      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-        <div style={{ width: 295, flexShrink: 0, overflowY: 'auto', background: 'var(--bg-secondary)', borderRight: '1px solid var(--border)', display: 'flex', flexDirection: 'column' }}>
-          <div style={{ display: 'flex', borderBottom: '1px solid var(--border)', flexShrink: 0 }}>
+      {msg && <div className={`alert ${msgType === 'success' ? 'alert-success' : msgType === 'error' ? 'alert-error' : msgType === 'warning' ? 'alert-warning' : 'alert-info'}`} style={{ margin: 0, borderRadius: 0, fontSize: 12, padding: '6px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <div>{msg}</div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {msgAction && msgType === 'error' && <button className="btn btn-sm btn-secondary" onClick={() => msgAction()} style={{ padding: '4px 10px' }}>Retry</button>}
+          <button onClick={() => { setMsg(''); setMsgAction(null) }} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'inherit', fontSize: 14 }}>×</button>
+        </div>
+      </div>}
+      <div style={{ display: 'grid', flex: 1, gridTemplateColumns: '320px 1fr 320px', gap: 16, overflow: 'hidden', padding: 20 }}>
+        <aside style={{ display: 'flex', flexDirection: 'column', overflowY: 'auto', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 20, padding: 18, gap: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+            <div>
+              <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-muted)' }}>Map Designer</div>
+              <div style={{ fontSize: 16, fontWeight: 800 }}>Layout & Controls</div>
+            </div>
+            <button className="btn btn-secondary btn-sm" onClick={() => setTab('compose')} style={{ whiteSpace: 'nowrap' }}>Quick Reset</button>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8 }}>
             {([['compose', 'Template', <Settings size={11} />], ['layers', 'Layer', <Layers size={11} />], ['inset', 'Inset', <Img size={11} />], ['export', 'Ekspor', <Download size={11} />]] as [Tab, string, React.ReactNode][]).map(([k, l, i]) => (
               <button key={k} onClick={() => setTab(k)} style={{ flex: 1, padding: '9px 2px', fontSize: 10, fontWeight: 600, background: 'none', border: 'none', cursor: 'pointer', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2, color: tab === k ? 'var(--accent)' : 'var(--text-muted)', borderBottom: tab === k ? '2px solid var(--accent)' : '2px solid transparent' }}>{i}{l}</button>
             ))}
@@ -520,6 +766,33 @@ export default function Maps() {
                     {(['landscape', 'portrait'] as const).map(o => (
                       <button key={o} onClick={() => setMeta(p => ({ ...p, orientation: o }))} style={{ flex: 1, padding: '8px 0', borderRadius: 6, fontSize: 11, fontWeight: 700, textTransform: 'capitalize', border: `1px solid ${meta.orientation === o ? 'var(--accent)' : 'var(--border)'}`, background: meta.orientation === o ? 'var(--accent-dim)' : 'var(--bg-tertiary)', color: meta.orientation === o ? 'var(--accent)' : 'var(--text)' }}>{o}</button>
                     ))}
+                  </div>
+
+                  <div style={{ padding: 12, borderRadius: 12, border: '1px solid var(--border)', background: 'var(--bg-tertiary)', marginBottom: 14 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: 10 }}>Mode Layout</div>
+                    <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+                      {(['template', 'composer'] as LayoutMode[]).map(mode => (
+                        <button key={mode} onClick={() => setLayoutMode(mode)} style={{ flex: 1, padding: '9px 0', borderRadius: 8, border: `1px solid ${layoutMode === mode ? 'var(--accent)' : 'var(--border)'}`, background: layoutMode === mode ? 'var(--accent-dim)' : 'var(--bg-tertiary)', color: layoutMode === mode ? 'var(--accent)' : 'var(--text)', fontSize: 11, fontWeight: 700 }}>{mode === 'composer' ? 'Composer' : 'Template'}</button>
+                      ))}
+                    </div>
+                    {layoutMode === 'composer' && (
+                      <div style={{ display: 'grid', gap: 8 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
+                          <div style={{ fontSize: 12, fontWeight: 700 }}>Atur Elemen Layout</div>
+                          <button className="btn btn-secondary btn-sm" style={{ padding: '6px 10px' }} onClick={() => setLayoutItems(getDefaultLayoutItems(MAP_W, MAP_H))}>Reset Layout</button>
+                        </div>
+                        {layoutItems.map(item => (
+                          <div key={item.id} style={{ display: 'grid', gridTemplateColumns: '1fr auto auto', alignItems: 'center', gap: 8, padding: 10, border: '1px solid var(--border)', borderRadius: 8 }}>
+                            <div>
+                              <div style={{ fontSize: 12, fontWeight: 600 }}>{item.label}</div>
+                              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>L {Math.round(item.left)} · T {Math.round(item.top)} · W {Math.round(item.width)} · H {Math.round(item.height)}</div>
+                            </div>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}><input type="checkbox" checked={item.visible} onChange={(e) => setLayoutItems(prev => prev.map(i => i.id === item.id ? { ...i, visible: e.target.checked } : i))} />Tampil</label>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }}><input type="checkbox" checked={item.locked} onChange={(e) => setLayoutItems(prev => prev.map(i => i.id === item.id ? { ...i, locked: e.target.checked } : i))} />Kunci</label>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
 
                   <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: 8 }}>Template</div>
@@ -549,10 +822,59 @@ export default function Maps() {
             {tab === 'inset' && <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}><div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase' }}>Peta Inset / Lokasi</div><div style={{ display: 'flex', alignItems: 'center', gap: 8 }}><input type="checkbox" id="si" checked={showInset} onChange={e => setShowInset(e.target.checked)} /><label htmlFor="si" style={{ fontSize: 12, cursor: 'pointer' }}>Tampilkan peta inset</label></div>{showInset && <label style={{ display: 'block', padding: 12, border: '2px dashed var(--border)', borderRadius: 8, cursor: 'pointer', textAlign: 'center', fontSize: 12, color: 'var(--text-muted)' }}><Img size={20} style={{ display: 'block', margin: '0 auto 6px' }} />{insetUrl ? 'Ganti gambar inset' : 'Upload gambar inset (PNG/JPG)'}<input type="file" accept="image/*" style={{ display: 'none' }} onChange={async e => { if (e.target.files?.[0]) { const url = await toDataURL(e.target.files[0]); setInsetUrl(url) } }} /></label>}</div>}
             {tab === 'export' && <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}><button className="btn btn-primary" onClick={() => doExport('png')} disabled={exporting} style={{ justifyContent: 'center' }}>{exporting ? <RefreshCw size={13} style={{ animation: 'spin 0.7s linear infinite' }} /> : <Download size={13} />} Unduh PNG</button><button className="btn btn-secondary" onClick={() => doExport('pdf')} disabled={exporting} style={{ justifyContent: 'center' }}>{exporting ? <RefreshCw size={13} style={{ animation: 'spin 0.7s linear infinite' }} /> : <Download size={13} />} Unduh PDF</button></div>}
           </div>
-        </div>
-        <div style={{ flex: 1, overflow: 'auto', background: template === 'dark' ? '#0d1117' : '#dde3ea', padding: 20 }}><div style={{ maxWidth: '100%', display: 'flex', justifyContent: 'center' }}><div ref={wrapRef} style={{ position: 'relative', width: MAP_W, height: MAP_H, boxShadow: '0 20px 50px rgba(0,0,0,0.5)', background: '#fff', overflow: 'hidden' }}><div ref={mapDivRef} style={{ ...mapStyle, position: 'absolute', zIndex: 1 }} /><div ref={frameRef} style={{ position: 'relative', zIndex: 10, width: '100%', height: '100%', pointerEvents: 'none' }}><MapFrame template={template} meta={meta} font={font} layers={layers} showInset={showInset} insetUrl={insetUrl} ticks={ticks} dynamicScale={dynamicScale} /></div></div></div></div>
+        </aside>
+        <main style={{ position: 'relative', overflow: 'auto', background: template === 'dark' ? '#111821' : '#f2f6fb', padding: 20, borderRadius: 20, display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+          <div ref={wrapRef} style={{ position: 'relative', width: MAP_W, height: MAP_H, minWidth: 0, minHeight: 0, boxShadow: '0 30px 80px rgba(0,0,0,0.18)', borderRadius: 20, overflow: 'hidden', background: '#fff' }}>
+            <div ref={mapDivRef} style={{ ...mapStyle, position: 'absolute', inset: 0, zIndex: 1 }} />
+            <div ref={frameRef} style={{ position: 'relative', zIndex: 10, width: '100%', height: '100%', pointerEvents: 'none' }}>
+              <MapFrame template={template} meta={meta} font={font} layers={layers} showInset={showInset} insetUrl={insetUrl} ticks={ticks} dynamicScale={dynamicScale} layoutMode={layoutMode} layoutItems={layoutItems} onLayoutChange={(item) => setLayoutItems(prev => prev.map(i => i.id === item.id ? item : i))} />
+            </div>
+          </div>
+        </main>
+        <aside style={{ display: 'flex', flexDirection: 'column', overflowY: 'auto', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 20, padding: 18, gap: 16 }}>
+          <div>
+            <div style={{ fontSize: 11, fontWeight: 700, textTransform: 'uppercase', color: 'var(--text-muted)' }}>Inspector</div>
+            <div style={{ fontSize: 16, fontWeight: 800, marginTop: 6 }}>{sel ? sel.name : 'Map Summary'}</div>
+          </div>
+          {sel ? (
+            <div style={{ display: 'grid', gap: 12, padding: 14, borderRadius: 18, background: 'var(--bg-tertiary)', border: '1px solid var(--border)' }}>
+              <div style={{ display: 'grid', gap: 4 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)' }}>Layer type</div>
+                <div style={{ fontSize: 13, fontWeight: 700 }}>{sel.featureType.toUpperCase()}</div>
+              </div>
+              <div style={{ display: 'grid', gap: 4 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)' }}>Features</div>
+                <div style={{ fontSize: 13 }}>{sel.featureCount ?? 0}</div>
+              </div>
+              <div style={{ display: 'grid', gap: 4 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)' }}>Visible</div>
+                <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, color: sel.visible ? 'var(--success)' : 'var(--text-muted)' }}>{sel.visible ? 'Yes' : 'Hidden'}</div>
+              </div>
+              <button className="btn btn-secondary btn-sm" onClick={() => setSelId(null)}>Deselect</button>
+            </div>
+          ) : (
+            <div style={{ display: 'grid', gap: 12, padding: 14, borderRadius: 18, background: 'var(--bg-tertiary)', border: '1px solid var(--border)' }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)' }}>Map details</div>
+              <div style={{ display: 'grid', gap: 6, fontSize: 12 }}>
+                <div>Layers: {layers.length}</div>
+                <div>Proj: {meta.projection || 'WGS84'}</div>
+                <div>Grid: {showGrid ? 'On' : 'Off'}</div>
+                <div>Paper: {meta.paperSize} / {meta.orientation}</div>
+              </div>
+            </div>
+          )}
+          <div style={{ display: 'grid', gap: 10, padding: 14, borderRadius: 18, background: 'var(--bg-tertiary)', border: '1px solid var(--border)' }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)' }}>Quick export</div>
+            <button className="btn btn-primary" onClick={() => doExport('png')} disabled={exporting} style={{ justifyContent: 'center' }}>{exporting ? <RefreshCw size={13} style={{ animation: 'spin 0.7s linear infinite' }} /> : <Download size={13} />} PNG</button>
+            <button className="btn btn-secondary" onClick={() => doExport('pdf')} disabled={exporting} style={{ justifyContent: 'center' }}>{exporting ? <RefreshCw size={13} style={{ animation: 'spin 0.7s linear infinite' }} /> : <Download size={13} />} PDF</button>
+          </div>
+        </aside>
       </div>
-      <style>{`.leaflet-label-clean{background:transparent!important;border:none!important;box-shadow:none!important;padding:0!important;}`}</style>
+      <style>{`
+        .leaflet-label-clean{background:transparent!important;border:none!important;box-shadow:none!important;padding:0!important;}
+        .um-point-icon{background:transparent!important;border:none!important;}
+        .leaflet-interactive{transition: stroke 140ms ease, fill 140ms ease, opacity 140ms ease;}
+      `}</style>
     </div>
   )
 }

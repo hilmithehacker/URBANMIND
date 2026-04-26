@@ -71,6 +71,8 @@ export async function loadJSZip(): Promise<void> {
   return jszipPromise
 }
 
+const API_BASE = import.meta.env.VITE_API_URL?.trim() || '/api'
+
 /** Parse ZIP langsung via backend — lebih reliabel untuk file besar */
 export async function parseZipViaBackend(file: File): Promise<{
   success: boolean
@@ -83,10 +85,14 @@ export async function parseZipViaBackend(file: File): Promise<{
   formData.append('file', file)
 
   try {
-    const res = await fetch('http://localhost:3001/api/geoparse/zip', {
+    const res = await fetch(`${API_BASE}/geoparse/zip`, {
       method: 'POST',
       body: formData
     })
+    if (!res.ok) {
+      const text = await res.text()
+      return { success: false, error: `Backend parse error (${res.status}): ${text}` }
+    }
     const json = await res.json()
     return json
   } catch (e: any) {

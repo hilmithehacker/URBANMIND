@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+﻿import React, { useEffect, useMemo, useState } from 'react'
 import axios from 'axios'
 import ReactMarkdown from 'react-markdown'
 import {
@@ -11,6 +11,8 @@ import { useToast } from '../context/ToastContext'
 type ReadingStatus = 'to-read' | 'reading' | 'reviewed' | 'used'
 type TabKey = 'search' | 'saved' | 'matrix' | 'gap' | 'draft' | 'evidence'
 type CitationStyle = 'APA' | 'IEEE' | 'Chicago'
+type ViewMode = 'compact' | 'detailed'
+type ResultSort = 'relevance' | 'year-desc' | 'year-asc'
 
 type Paper = {
   id: string
@@ -46,6 +48,13 @@ type GapCard = {
   priority: number
 }
 
+type PaperInsight = {
+  method: string
+  gap: string
+  weakness: string
+  bestPractice: string
+}
+
 const api = axios.create({ baseURL: '/api/literature' })
 const uid = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
@@ -68,6 +77,22 @@ function parseMethodFromAbstract(a = ''): string {
   if (x.includes('machine learning')) return 'Machine Learning'
   if (x.includes('qualitative')) return 'Qualitative'
   return 'Not specified'
+}
+
+function heuristicInsightFromPaper(p: Paper): PaperInsight {
+  const method = p.method || parseMethodFromAbstract(p.abstract)
+  const abs = (p.abstract || '').toLowerCase()
+  const hasLimit = abs.includes('limit') || abs.includes('keterbatasan') || abs.includes('however') || abs.includes('namun')
+  const hasPolicy = abs.includes('policy') || abs.includes('kebijakan')
+  const hasSpatial = abs.includes('spatial') || abs.includes('wilayah') || abs.includes('urban')
+  const hasTime = abs.includes('longitudinal') || abs.includes('time series') || abs.includes('temporal')
+
+  return {
+    method,
+    gap: hasTime ? 'Perlu validasi lintas wilayah/kelompok untuk memperkuat generalisasi.' : 'Belum terlihat evaluasi longitudinal yang kuat pada konteks berbeda.',
+    weakness: hasLimit ? 'Studi menyebutkan keterbatasan; perlu kontrol confounding dan validasi eksternal.' : 'Potensi bias sampel/variabel belum dijelaskan lengkap.',
+    bestPractice: `${hasPolicy ? 'Integrasi kebijakan lokal' : 'Integrasi variabel konteks'}${hasSpatial ? ' + analisis spasial' : ' + indikator berbasis lokasi'} untuk keputusan yang lebih robust.`,
+  }
 }
 
 function toAPA(p: Paper) {
@@ -145,6 +170,10 @@ export default function LiteratureResearchHubFinal() {
   const [qbMethod, setQbMethod] = useState('')
   const [qbYearFrom, setQbYearFrom] = useState('')
   const [qbYearTo, setQbYearTo] = useState('')
+  const [viewMode, setViewMode] = useState<ViewMode>('compact')
+  const [resultSort, setResultSort] = useState<ResultSort>('relevance')
+  const [insightMap, setInsightMap] = useState<Record<string, PaperInsight>>({})
+  const [insightLoadingId, setInsightLoadingId] = useState<string | null>(null)
 
   useEffect(() => {
     ; (async () => {
@@ -159,6 +188,23 @@ export default function LiteratureResearchHubFinal() {
   }, [projectId])
 
   const resultCount = results.length
+  const displayedResults = useMemo(() => {
+    const cloned = [...results]
+    if (resultSort === 'year-desc') {
+      cloned.sort((a, b) => (b.year || 0) - (a.year || 0))
+      return cloned
+    }
+    if (resultSort === 'year-asc') {
+      cloned.sort((a, b) => (a.year || 0) - (b.year || 0))
+      return cloned
+    }
+    cloned.sort((a, b) => {
+      const ar = a.abstract?.length || 0
+      const br = b.abstract?.length || 0
+      return br - ar
+    })
+    return cloned
+  }, [results, resultSort])
   const selectedPapers = useMemo(
     () => savedPapers.filter((s) => selectedIds.includes(s.paper.id)).map((s) => s.paper),
     [savedPapers, selectedIds]
@@ -237,7 +283,7 @@ export default function LiteratureResearchHubFinal() {
   const appendToChatThread = (paper: Paper, tag: string, content: string) => {
     setChat((prev) => [
       ...prev,
-      { id: uid(), role: 'assistant', content: `### ${tag} — ${paper.title}\n\n${content}`, paperId: paper.id, tag },
+      { id: uid(), role: 'assistant', content: `### ${tag} - ${paper.title}\n\n${content}`, paperId: paper.id, tag },
     ])
     setChatThreadPaperId(paper.id)
   }
@@ -263,6 +309,59 @@ export default function LiteratureResearchHubFinal() {
       appendToChatThread(paper, action, res?.data?.data?.text || 'Tidak ada output.')
     } catch {
       appendToChatThread(paper, action, 'Gagal mengambil output AI. Coba ulang lagi.')
+    }
+  }
+
+  const runAutoReview = async (paper: Paper) => {
+    if (insightLoadingId) return
+    setInsightLoadingId(paper.id)
+    try {
+      const prompt = `Analisis paper berikut secara ringkas dalam JSON valid:
+{
+  "method":"...",
+  "gap":"...",
+  "weakness":"...",
+  "bestPractice":"..."
+}
+Paper:
+Title: ${paper.title}
+Year: ${paper.year || 'N/A'}
+Journal: ${paper.journal || 'N/A'}
+Abstract: ${paper.abstract || 'N/A'}
+`
+      const res = await axios.post('/api/ai/chat', {
+        messages: [{ role: 'user', content: prompt }],
+        projectContext: activeProject ? `${activeProject.name} (${activeProject.location})` : undefined,
+        literatureContext: { paper }
+      })
+      const txt = String(res?.data?.data?.text || '').trim()
+      const m = txt.match(/\{[\s\S]*\}/)
+      let parsed: PaperInsight | null = null
+      if (m) {
+        try {
+          const obj = JSON.parse(m[0])
+          if (obj?.method && obj?.gap && obj?.weakness && obj?.bestPractice) parsed = obj
+        } catch {
+          // fallback below
+        }
+      }
+      const insight = parsed || heuristicInsightFromPaper(paper)
+      setInsightMap((prev) => ({ ...prev, [paper.id]: insight }))
+      appendToChatThread(
+        paper,
+        'Auto Review',
+        `**Method**: ${insight.method}\n\n**Gap**: ${insight.gap}\n\n**Weakness**: ${insight.weakness}\n\n**Best Practice**: ${insight.bestPractice}`
+      )
+    } catch {
+      const fallback = heuristicInsightFromPaper(paper)
+      setInsightMap((prev) => ({ ...prev, [paper.id]: fallback }))
+      appendToChatThread(
+        paper,
+        'Auto Review',
+        `**Method**: ${fallback.method}\n\n**Gap**: ${fallback.gap}\n\n**Weakness**: ${fallback.weakness}\n\n**Best Practice**: ${fallback.bestPractice}`
+      )
+    } finally {
+      setInsightLoadingId(null)
     }
   }
 
@@ -359,7 +458,7 @@ ${refs}`)
     setChatLoading(true)
 
     try {
-      const projectContext = activeProject ? `${activeProject.name} — ${activeProject.location} (${activeProject.type})` : undefined
+      const projectContext = activeProject ? `${activeProject.name} - ${activeProject.location} (${activeProject.type})` : undefined
       const savedLite = savedPapers.slice(0, 15).map((s) => ({
         id: s.paper.id,
         title: s.paper.title,
@@ -455,7 +554,15 @@ ${refs}`)
         <section className="panel glass">
           {activeTab === 'search' && (
             <>
-              <div className="panel-head"><h2>Cari Jurnal</h2><span>{resultCount} hasil</span></div>
+              <div className="panel-head">
+                <h2>Cari Jurnal</h2>
+                <div className="row">
+                  <span className="badge">{resultCount} hasil</span>
+                  <button className="btn btn-ghost btn-sm" type="button" onClick={() => setViewMode((v) => (v === 'compact' ? 'detailed' : 'compact'))}>
+                    Mode: {viewMode === 'compact' ? 'Compact' : 'Detailed'}
+                  </button>
+                </div>
+              </div>
 
               <form onSubmit={handleSearch} className="search-row">
                 <div className="search-input">
@@ -463,6 +570,7 @@ ${refs}`)
                   <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Contoh: transit oriented development jakarta" />
                 </div>
                 <select value={limit} onChange={(e) => setLimit(e.target.value)}><option value="10">10</option><option value="20">20</option><option value="50">50</option></select>
+                <select value={resultSort} onChange={(e) => setResultSort(e.target.value as ResultSort)}><option value="relevance">Relevance</option><option value="year-desc">Year Desc</option><option value="year-asc">Year Asc</option></select>
                 <label className="oa"><input type="checkbox" checked={openAccessOnly} onChange={(e) => setOpenAccessOnly(e.target.checked)} />OA only</label>
                 <button className="btn btn-primary" type="submit">{searching ? <Loader2 size={14} className="spin" /> : <Sparkles size={14} />}Search</button>
               </form>
@@ -479,26 +587,37 @@ ${refs}`)
                 </div>
               </div>
 
-              <div className="list">
-                {results.length === 0 ? <div className="empty">Belum ada hasil jurnal.</div> : results.map((p) => (
-                  <article className="card" key={p.id}>
-                    <h3>{p.title || 'Untitled'}</h3>
-                    <p className="meta">{(p.authors?.length ? p.authors.join(', ') : 'Unknown')} • {p.year || 'N/A'} {p.journal ? `• ${p.journal}` : ''}</p>
-                    <p className="abs">{p.abstract || 'Abstract tidak tersedia.'}</p>
-                    <div className="actions">
-                      {p.url && <a href={p.url} target="_blank" rel="noreferrer" className="btn btn-ghost btn-sm"><ExternalLink size={13} />Source</a>}
-                      {p.pdfUrl && <a href={p.pdfUrl} target="_blank" rel="noreferrer" className="btn btn-ghost btn-sm"><FileText size={13} />PDF</a>}
-                      <button className="btn btn-primary btn-sm" onClick={() => savePaper(p)}><Save size={13} />Save</button>
-                    </div>
-                    <div className="copilot-actions">
-                      <button className="btn btn-ghost btn-sm" onClick={() => runCopilot(p, 'Ringkas')}>Ringkas</button>
-                      <button className="btn btn-ghost btn-sm" onClick={() => runCopilot(p, 'Kritik Metode')}>Kritik Metode</button>
-                      <button className="btn btn-ghost btn-sm" onClick={() => runCopilot(p, 'Ekstrak Variabel')}>Ekstrak Variabel</button>
-                      <button className="btn btn-ghost btn-sm" onClick={() => runCopilot(p, 'Quality & Bias')}><FlaskConical size={13} />Bias Check</button>
-                      <button className="btn btn-ghost btn-sm" onClick={() => runCopilot(p, 'Buat Sitasi')}>Buat Sitasi</button>
-                    </div>
-                  </article>
-                ))}</div>
+              <div className={`list ${viewMode === 'compact' ? 'compact' : 'detailed'}`}>
+                {displayedResults.length === 0 ? <div className="empty">Belum ada hasil jurnal.</div> : displayedResults.map((p) => {
+                  const insight = insightMap[p.id] || heuristicInsightFromPaper(p)
+                  return (
+                    <article className="card" key={p.id}>
+                      <h3>{p.title || 'Untitled'}</h3>
+                      <p className="meta">{(p.authors?.length ? p.authors.join(', ') : 'Unknown')} • {p.year || 'N/A'} {p.journal ? `• ${p.journal}` : ''}</p>
+                      <p className="abs">{viewMode === 'compact' ? (p.abstract || 'Abstract tidak tersedia.').slice(0, 280) + ((p.abstract || '').length > 280 ? '...' : '') : (p.abstract || 'Abstract tidak tersedia.')}</p>
+                      <div className="insight-mini">
+                        <span><strong>Metode:</strong> {insight.method}</span>
+                        <span><strong>Gap:</strong> {insight.gap}</span>
+                      </div>
+                      <div className="actions">
+                        {p.url && <a href={p.url} target="_blank" rel="noreferrer" className="btn btn-ghost btn-sm"><ExternalLink size={13} />Source</a>}
+                        {p.pdfUrl && <a href={p.pdfUrl} target="_blank" rel="noreferrer" className="btn btn-ghost btn-sm"><FileText size={13} />PDF</a>}
+                        <button className="btn btn-primary btn-sm" onClick={() => savePaper(p)}><Save size={13} />Save</button>
+                      </div>
+                      <div className="copilot-actions">
+                        <button className="btn btn-ghost btn-sm" onClick={() => runCopilot(p, 'Ringkas')}>Ringkas</button>
+                        <button className="btn btn-ghost btn-sm" onClick={() => runCopilot(p, 'Kritik Metode')}>Kritik Metode</button>
+                        <button className="btn btn-ghost btn-sm" onClick={() => runCopilot(p, 'Ekstrak Variabel')}>Ekstrak Variabel</button>
+                        <button className="btn btn-ghost btn-sm" onClick={() => runCopilot(p, 'Quality & Bias')}><FlaskConical size={13} />Bias Check</button>
+                        <button className="btn btn-ghost btn-sm" onClick={() => runCopilot(p, 'Buat Sitasi')}>Buat Sitasi</button>
+                        <button className="btn btn-ghost btn-sm" onClick={() => runAutoReview(p)} disabled={insightLoadingId === p.id}>
+                          {insightLoadingId === p.id ? <Loader2 size={13} className="spin" /> : <Sparkles size={13} />} Auto Review
+                        </button>
+                      </div>
+                    </article>
+                  )
+                })}
+              </div>
             </>
           )}
 
@@ -558,7 +677,7 @@ ${refs}`)
 
           {activeTab === 'matrix' && (
             <>
-              <div className="panel-head"><h2>Compare 2–3 Paper</h2>{aiLoading && <Loader2 className="spin" size={16} />}</div>
+              <div className="panel-head"><h2>Compare 2-3 Paper</h2>{aiLoading && <Loader2 className="spin" size={16} />}</div>
               <div className="md-wrap"><ReactMarkdown>{aiResult || 'Klik "Compare 2-3" di tab Saved.'}</ReactMarkdown></div>
             </>
           )}
@@ -691,7 +810,7 @@ ${refs}`)
         .panel-head h2{font-size:14px;font-weight:700}
         .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
         .between{justify-content:space-between}
-        .search-row{padding:10px 12px;border-bottom:1px solid var(--border);display:grid;grid-template-columns:1fr 80px 92px 110px;gap:8px}
+        .search-row{padding:10px 12px;border-bottom:1px solid var(--border);display:grid;grid-template-columns:1fr 82px 120px 92px 110px;gap:8px}
         .search-input{display:flex;align-items:center;gap:8px;border:1px solid var(--border);border-radius:10px;padding:0 10px;background:var(--bg-primary)}
         .search-input input,.search-row select,.qb-grid input,.chat-input textarea,.search-mini input,.gap-card input,.card textarea,.row select{
           background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border);border-radius:8px;padding:8px;outline:none
@@ -701,6 +820,11 @@ ${refs}`)
         .query-builder{padding:10px 12px;border-bottom:1px solid var(--border);display:grid;gap:8px}
         .qb-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}
         .list{flex:1;min-height:0;overflow:auto;padding:10px;display:grid;gap:10px}
+        .list.compact .card{padding:9px}
+        .list.compact .abs{font-size:12.5px}
+        .list.detailed .card{padding:12px}
+        .insight-mini{display:grid;gap:4px;padding:8px;border:1px dashed var(--border);border-radius:8px;background:color-mix(in srgb,var(--bg-secondary) 82%,transparent)}
+        .insight-mini span{font-size:12px;color:var(--text-secondary)}
         .card{border:1px solid var(--border);border-radius:12px;padding:10px;background:var(--bg-primary);display:grid;gap:8px}
         .card h3{font-size:14px;font-weight:700}
         .meta{font-size:12px;color:var(--text-muted)}
@@ -730,9 +854,13 @@ ${refs}`)
         .loading-row{font-size:12px;color:var(--text-muted);display:flex;align-items:center;gap:6px}
         .spin{animation:spin 1s linear infinite}
         @keyframes spin{to{transform:rotate(360deg)}}
-        @media (max-width: 1280px){.lit-grid{grid-template-columns:1fr}.search-row{grid-template-columns:1fr 80px 1fr 110px}}
+        @media (max-width: 1280px){.lit-grid{grid-template-columns:1fr}.search-row{grid-template-columns:1fr 82px 1fr 92px 110px}}
         @media (max-width: 860px){.search-row{grid-template-columns:1fr}.qb-grid{grid-template-columns:1fr 1fr}}
       `}</style>
     </div>
   )
 }
+
+
+
+
